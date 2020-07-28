@@ -48,6 +48,11 @@ def _get_shebang_from_file(file_path: str) -> Optional[str]:
 
 
 def _find_executable(*, command: str, prime_dir: str) -> Optional[str]:
+    """Find executable in common binary path locations.
+
+    :returns: path to executable found, whether it is in searched
+              prime directory paths, or on host using shutil.which().
+    """
     binary_paths = (
         os.path.join(p, command) for p in common.get_bin_paths(root=prime_dir)
     )
@@ -69,8 +74,20 @@ def _find_executable(*, command: str, prime_dir: str) -> Optional[str]:
 def _resolve_snap_command_path(
     *, command: str, prime_dir: str
 ) -> Tuple[Optional[str], bool]:
+    """Resolve given command relative to prime directory.
+
+    For backwards compatibility, search for command in typical binary
+    paths.  This would appear to assume that command is the basename,
+    but prior behavior does not check for this, so it could be found
+    relative to the binary paths.
+
+    :returns: tuple of (resolved_command, search_required).
+              If not found relative to prime directory, return
+              absolute path to resolved command if found via
+              shutil.which() - else return None for resolved_command.
+    """
+
     search_required = False
-    command = _strip_command_leaders(command)
 
     # If not where it claims to be, search for backwards compatibility.
     if not os.path.exists(os.path.join(prime_dir, command)):
@@ -88,37 +105,42 @@ def _resolve_snap_command_path(
     return command, search_required
 
 
-def _strip_command_leaders(command: str) -> str:
-    # Strip leading "/"
-    command = re.sub(r"^/", "", command)
-
-    # Strip leading "$SNAP/"
-    command = re.sub(r"^\$SNAP/", "", command)
-
-    return command
-
-
 def _split_command(*, command: str, prime_dir: str) -> Tuple[List[str], List[str]]:
-    """Parse command, returning (interpreter, command)."""
+    """Parse specified command string, including interpreter, if any.
+
+    :returns: tuple of (interpreter parts, command parts) where interpreter parts
+              is an empty list of there is none.
+    """
+    interpreter_parts: List[str] = list()
 
     # posix is set to False to respect the quoting of variables.
     command_parts = shlex.split(command, posix=False)
-    command_path = os.path.join(prime_dir, _strip_command_leaders(command_parts[0]))
 
-    shebang_parts: List[str] = list()
+    command_path = os.path.join(prime_dir, command_parts[0])
     if os.path.exists(command_path):
         shebang = _get_shebang_from_file(command_path)
         if shebang:
-            shebang_parts = shlex.split(shebang, posix=False)
+            interpreter_parts = shlex.split(shebang, posix=False)
 
-    return shebang_parts, command_parts
+    return interpreter_parts, command_parts
 
 
 def _resolve_interpreter_parts(
-    *, shebang_parts: List[str], command_parts: List[str], prime_dir: str
+    *, interpreter_parts: List[str], command_parts: List[str], prime_dir: str
 ) -> List[str]:
+    """Resolve the interpreter parts to a format suitable for use in a snap.yaml.
+
+    Logs warnings for any changes that are required that user should be
+    aware of.
+
+    If unable to find interpreter, warn but return with
+    unresolved interpreter.
+
+    :returns: list of resolved interpreter parts, empty if none.
+    """
+
     # Remove the leading /usr/bin/env and resolve it now.
-    resolved_parts = shebang_parts.copy()
+    resolved_parts = interpreter_parts.copy()
     if resolved_parts[0] == "/usr/bin/env":
         resolved_parts = resolved_parts[1:]
 
@@ -127,13 +149,18 @@ def _resolve_interpreter_parts(
     if resolved_parts[0].startswith("/"):
         return []
 
+    # Strip leading unneed $SNAP from command, if present.
+    resolved_parts[0] = re.sub(r"^\$SNAP/", "", resolved_parts[0])
+
     resolved_interpreter, search_required = _resolve_snap_command_path(
         command=resolved_parts[0], prime_dir=prime_dir
     )
 
     if resolved_interpreter is None:
         # Note this is not a hard error, just warn.
-        logger.warning("Unable to find interpreter in any paths: {resolved_parts[0]!r}")
+        logger.warning(
+            f"Unable to find interpreter in any paths: {resolved_parts[0]!r}"
+        )
     elif search_required:
         logger.warning(
             f"The interpreter {resolved_parts[0]!r} for {command_parts[0]!r} was resolved to {resolved_interpreter!r}."
@@ -148,6 +175,14 @@ def _resolve_interpreter_parts(
 def _resolve_command_parts(
     *, command_parts: List[str], interpreted_command: bool, prime_dir: str
 ) -> List[str]:
+    """Resolve the command parts to a format suitable for use in a snap.yaml.
+
+    If command requires an interpreter, prepend the $SNAP so it can be
+    found correctly be the invoked interpreter.
+
+    :returns: list of resolved command parts.
+    """
+
     resolved_parts = command_parts.copy()
     resolved_command, search_required = _resolve_snap_command_path(
         command=resolved_parts[0], prime_dir=prime_dir
@@ -183,32 +218,34 @@ def _massage_command(*, command: str, prime_dir: str) -> str:
         is ambiguous.  If found in prime_dir, set the path relative
         to snap.
 
-    Returns massaged command."""
+    :returns: massaged command."""
 
     # If command starts with "/" we have no option but to use a wrapper.
     if command.startswith("/"):
         return command
 
+    # Strip leading unneed $SNAP from command, if present.
     massaged_command = re.sub(r"^\$SNAP/", "", command)
-    shebang_parts, command_parts = _split_command(
+
+    interpreter_parts, command_parts = _split_command(
         command=massaged_command, prime_dir=prime_dir
     )
 
-    if shebang_parts:
-        shebang_parts = _resolve_interpreter_parts(
-            shebang_parts=shebang_parts,
+    if interpreter_parts:
+        interpreter_parts = _resolve_interpreter_parts(
+            interpreter_parts=interpreter_parts,
             command_parts=command_parts,
             prime_dir=prime_dir,
         )
 
-    interpreted_command = len(shebang_parts) > 0
+    interpreted_command = len(interpreter_parts) > 0
     command_parts = _resolve_command_parts(
         command_parts=command_parts,
         interpreted_command=interpreted_command,
         prime_dir=prime_dir,
     )
 
-    massaged_command = " ".join(shebang_parts + command_parts)
+    massaged_command = " ".join(interpreter_parts + command_parts)
 
     # Inform the user of any changes.
     if massaged_command != command:
